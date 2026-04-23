@@ -76,17 +76,25 @@ def resolve_window(args: argparse.Namespace) -> tuple[str, str]:
 # Call record assembly
 # ---------------------------------------------------------------------------
 
-def build_call_records(from_iso: str, to_iso: str) -> list[dict]:
-    """Fetch extensive metadata + transcripts, merge into the shape mapping.py expects."""
+def fetch_call_metadata(from_iso: str, to_iso: str) -> list[dict]:
+    """Fetch extensive metadata only. Each call retains `_speaker_map` for later
+    use by `attach_transcripts`."""
     calls = fetch_calls_extensive(from_iso, to_iso)
+    out = list(calls.values())
+    out.sort(key=lambda c: c.get("started", ""))
+    return out
+
+
+def attach_transcripts(calls: list[dict]) -> None:
+    """Fetch transcripts for the given calls and merge them in place. Consumes
+    each call's `_speaker_map` to resolve speaker names."""
     if not calls:
-        return []
-    transcripts = fetch_transcripts(call_ids=list(calls.keys()))
-    out: list[dict] = []
-    for call_id, call in calls.items():
+        return
+    transcripts = fetch_transcripts(call_ids=[c["call_id"] for c in calls])
+    for call in calls:
         speaker_map = call.pop("_speaker_map", {})
         resolved_turns: list[dict] = []
-        for mono in transcripts.get(call_id, []):
+        for mono in transcripts.get(call["call_id"], []):
             speaker_name = speaker_map.get(
                 mono["speakerId"], f"Speaker {mono['speakerId']}"
             )
@@ -97,9 +105,6 @@ def build_call_records(from_iso: str, to_iso: str) -> list[dict]:
                 }
             )
         call["transcript"] = resolved_turns
-        out.append(call)
-    out.sort(key=lambda c: c.get("started", ""))
-    return out
 
 
 def filter_external(calls: list[dict]) -> list[dict]:
@@ -126,19 +131,12 @@ def process_call(
     notion: NotionClient,
     data_source_id: str,
     email_to_user_id: dict[str, str],
-    existing_urls: dict[str, str],
     report: RunReport,
     dry_run: bool,
     dump_sink: list | None = None,
 ) -> None:
     title = call.get("title") or call.get("call_id", "<unknown>")
     gong_url = call.get("url", "")
-
-    if gong_url and gong_url in existing_urls:
-        report.skipped.append(
-            SkippedRow(title=title, notion_page_id=existing_urls[gong_url])
-        )
-        return
 
     facilitator_email = resolve_facilitator_email(call)
     properties = build_properties(call, email_to_user_id, facilitator_email)
@@ -270,8 +268,8 @@ def main() -> int:
 
     report = RunReport(window_start=from_iso, window_end=to_iso, dry_run=args.dry_run)
 
-    print(f"Fetching Gong calls {from_iso} → {to_iso} ...", file=sys.stderr)
-    all_calls = build_call_records(from_iso, to_iso)
+    print(f"Fetching Gong call metadata {from_iso} → {to_iso} ...", file=sys.stderr)
+    all_calls = fetch_call_metadata(from_iso, to_iso)
     report.candidates_from_gong = len(all_calls)
     external = filter_external(all_calls)
     report.external_customer = len(external)
@@ -292,15 +290,35 @@ def main() -> int:
         existing_urls = notion.fetch_existing_source_urls(data_source_id)
         print(f"  {len(existing_urls)} existing pages with a source URL", file=sys.stderr)
 
+        new_calls: list[dict] = []
+        for call in external:
+            gong_url = call.get("url", "")
+            if gong_url and gong_url in existing_urls:
+                report.skipped.append(
+                    SkippedRow(
+                        title=call.get("title") or call.get("call_id", "<unknown>"),
+                        notion_page_id=existing_urls[gong_url],
+                    )
+                )
+            else:
+                new_calls.append(call)
+        print(
+            f"  {len(report.skipped)} already imported, {len(new_calls)} to process",
+            file=sys.stderr,
+        )
+
+        if new_calls:
+            print(f"Fetching transcripts for {len(new_calls)} calls...", file=sys.stderr)
+            attach_transcripts(new_calls)
+
         dump_sink: list | None = [] if args.dump else None
 
-        for call in external:
+        for call in new_calls:
             process_call(
                 call,
                 notion,
                 data_source_id,
                 email_to_user_id,
-                existing_urls,
                 report,
                 args.dry_run,
                 dump_sink,
