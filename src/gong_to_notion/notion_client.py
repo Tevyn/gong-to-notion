@@ -172,10 +172,42 @@ class NotionClient:
                 break
         return existing
 
-    # ---- Page creation -----------------------------------------------------
+    def query_data_source(
+        self,
+        data_source_id: str,
+        filter: dict | None = None,
+        sorts: list[dict] | None = None,
+        page_size: int = 100,
+    ) -> list[dict]:
+        """Paginated query returning every matching row (full page objects)."""
+        results: list[dict] = []
+        cursor: str | None = None
+        while True:
+            payload: dict = {"page_size": page_size}
+            if filter is not None:
+                payload["filter"] = filter
+            if sorts is not None:
+                payload["sorts"] = sorts
+            if cursor:
+                payload["start_cursor"] = cursor
+            page = self._request(
+                "POST", f"/data_sources/{data_source_id}/query", json=payload
+            )
+            results.extend(page.get("results", []))
+            if not page.get("has_more"):
+                break
+            cursor = page.get("next_cursor")
+            if not cursor:
+                break
+        return results
+
+    # ---- Page creation / update -------------------------------------------
 
     def create_page(
-        self, data_source_id: str, properties: dict, children: list[dict] | None = None
+        self,
+        data_source_id: str,
+        properties: dict,
+        children: list[dict] | None = None,
     ) -> dict:
         """Create a page under a data-source parent. Returns the created page object."""
         body: dict = {
@@ -185,6 +217,31 @@ class NotionClient:
         if children:
             body["children"] = children
         return self._request("POST", "/pages", json=body)
+
+    def update_page(self, page_id: str, properties: dict) -> dict:
+        """PATCH /pages/{id} with the given properties payload."""
+        return self._request(
+            "PATCH", f"/pages/{page_id}", json={"properties": properties}
+        )
+
+    def get_block_children(self, block_id: str) -> list[dict]:
+        """Paginated GET /blocks/{id}/children. Returns all child block objects."""
+        out: list[dict] = []
+        cursor: str | None = None
+        while True:
+            params: dict = {"page_size": 100}
+            if cursor:
+                params["start_cursor"] = cursor
+            page = self._request(
+                "GET", f"/blocks/{block_id}/children", params=params
+            )
+            out.extend(page.get("results", []))
+            if not page.get("has_more"):
+                break
+            cursor = page.get("next_cursor")
+            if not cursor:
+                break
+        return out
 
     def append_block_children(self, block_id: str, children: list[dict]) -> list[dict]:
         """Append children to a block in batches of ≤100 (Notion's per-call cap).
