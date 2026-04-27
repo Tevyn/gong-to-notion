@@ -69,13 +69,18 @@ def fetch_calls_extensive(
     body = {
         "filter": filt,
         "contentSelector": {
+            # `context: Extended` returns Gong's CRM-linked objects (Salesforce
+            # Accounts, Opportunities, Contacts). We use the Account objectIds
+            # to resolve which Notion Agency a call belongs to.
+            "context": "Extended",
+            "contextTiming": ["Now"],
             "exposedFields": {
                 # `parties` is a top-level exposedField, NOT under `content`.
                 # Nesting it under content silently returns `parties: []`.
                 "parties": True,
                 "content": {"brief": True},
                 "collaboration": {"publicComments": False},
-            }
+            },
         },
     }
 
@@ -99,10 +104,19 @@ def fetch_calls_extensive(
                         "email": email,
                         "affiliation": affiliation,
                         "user_id": user_id,
+                        "title": (p.get("title") or "").strip(),
                     }
                 )
                 if speaker_id:
                     speaker_map[speaker_id] = name
+
+            sf_account_ids: list[str] = []
+            for ctx in call.get("context") or []:
+                for obj in ctx.get("objects") or []:
+                    if obj.get("objectType") == "Account":
+                        oid = (obj.get("objectId") or "").strip()
+                        if oid and oid not in sf_account_ids:
+                            sf_account_ids.append(oid)
 
             duration_secs = meta.get("duration", 0)
             calls_by_id[meta.get("id", "")] = {
@@ -115,6 +129,8 @@ def fetch_calls_extensive(
                 "primary_user_id": meta.get("primaryUserId", ""),
                 "is_private": bool(meta.get("isPrivate", False)),
                 "brief": content.get("brief", ""),
+                "purpose": (meta.get("purpose") or "").strip(),
+                "salesforce_account_ids": sf_account_ids,
                 "participants": participants,
                 "_speaker_map": speaker_map,
             }

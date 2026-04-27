@@ -224,25 +224,6 @@ class NotionClient:
             "PATCH", f"/pages/{page_id}", json={"properties": properties}
         )
 
-    def get_block_children(self, block_id: str) -> list[dict]:
-        """Paginated GET /blocks/{id}/children. Returns all child block objects."""
-        out: list[dict] = []
-        cursor: str | None = None
-        while True:
-            params: dict = {"page_size": 100}
-            if cursor:
-                params["start_cursor"] = cursor
-            page = self._request(
-                "GET", f"/blocks/{block_id}/children", params=params
-            )
-            out.extend(page.get("results", []))
-            if not page.get("has_more"):
-                break
-            cursor = page.get("next_cursor")
-            if not cursor:
-                break
-        return out
-
     def append_block_children(self, block_id: str, children: list[dict]) -> list[dict]:
         """Append children to a block in batches of ≤100 (Notion's per-call cap).
 

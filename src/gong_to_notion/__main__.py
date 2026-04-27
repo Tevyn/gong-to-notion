@@ -25,8 +25,8 @@ from .agency_and_staff_fill import (
     FREE_MAIL_DOMAINS,
     INTERNAL_DOMAIN,
     apply_to_page,
+    domain_from_url,
     extract_domain,
-    extract_participants_emails,
     gong_external_people,
     load_fill_caches,
     resolve_call_links,
@@ -231,7 +231,11 @@ def process_call(
             try:
                 external = gong_external_people(call.get("participants", []))
                 resolution = resolve_call_links(
-                    notion, external, fill_caches, dry_run=False
+                    notion,
+                    external,
+                    fill_caches,
+                    sf_account_ids=call.get("salesforce_account_ids", []),
+                    dry_run=False,
                 )
                 apply_to_page(
                     notion,
@@ -417,9 +421,28 @@ def _resolve_backfill_window(args: argparse.Namespace) -> tuple[str, str]:
     return start, end
 
 
+_GONG_CALL_ID_RE = re.compile(r"[?&]id=(\d+)")
+
+_GONG_BATCH_SIZE = 100  # calls/extensive cap per request.
+
+
+def _gong_call_id_from_url(url: str | None) -> str | None:
+    if not url:
+        return None
+    m = _GONG_CALL_ID_RE.search(url)
+    return m.group(1) if m else None
+
+
 def cmd_backfill_agency_and_staff(args: argparse.Namespace) -> int:
+    """Re-fetch Gong for every Gong Recording page in the window and fill
+    Purpose / Agencies / Agency Staff / Role from the authoritative SF +
+    parties data. Purpose and Agencies overwrite when Gong has a value;
+    Agency Staff is additive; Role is blanks-only on existing rows."""
     notion_token = _require_env("NOTION_TOKEN")
     data_source_id = _require_env("NOTION_DATABASE_ID")
+    _require_env("GONG_ACCESS_KEY")
+    _require_env("GONG_ACCESS_KEY_SECRET")
+    _require_env("GONG_BASE_URL")
 
     from_iso, to_iso = _resolve_backfill_window(args)
     print(
@@ -433,6 +456,7 @@ def cmd_backfill_agency_and_staff(args: argparse.Namespace) -> int:
         caches = load_fill_caches(notion)
         print(
             f"  {len(caches.domain_to_agency)} agency domains, "
+            f"{len(caches.sf_account_to_agency)} SF accounts, "
             f"{len(caches.email_to_staff)} staff emails",
             file=sys.stderr,
         )
@@ -442,12 +466,6 @@ def cmd_backfill_agency_and_staff(args: argparse.Namespace) -> int:
                 {"timestamp": "created_time", "created_time": {"on_or_after": from_iso}},
                 {"timestamp": "created_time", "created_time": {"before": to_iso}},
                 {"property": "Format", "select": {"equals": "Gong Recording"}},
-                {
-                    "or": [
-                        {"property": "Agencies", "relation": {"is_empty": True}},
-                        {"property": "Agency Staff", "relation": {"is_empty": True}},
-                    ]
-                },
             ]
         }
         print("[backfill] querying candidate pages...", file=sys.stderr)
@@ -456,50 +474,80 @@ def cmd_backfill_agency_and_staff(args: argparse.Namespace) -> int:
             filter=filter_payload,
             sorts=[{"timestamp": "created_time", "direction": "descending"}],
         )
-        print(f"  {len(pages)} candidates", file=sys.stderr)
+        print(f"  {len(pages)} Gong Recording pages", file=sys.stderr)
         if args.limit:
             pages = pages[: args.limit]
             print(f"  limited to first {len(pages)}", file=sys.stderr)
 
+        # Pass 1: parse Gong call IDs. Pages with no Gong URL get reported but
+        # contribute nothing to the batch fetch.
+        page_call_ids: dict[str, str] = {}      # page_id → gong_call_id
+        pages_without_gong_id: list[tuple[str, str]] = []
+        for page in pages:
+            page_id = page.get("id", "")
+            props = page.get("properties") or {}
+            title = _read_title(props.get("Conversation Title"))
+            link = (props.get("Link to source") or {}).get("url") or ""
+            cid = _gong_call_id_from_url(link)
+            if not cid:
+                pages_without_gong_id.append((title, page.get("url", "")))
+                continue
+            page_call_ids[page_id] = cid
+
+        call_ids = sorted(set(page_call_ids.values()))
+        print(
+            f"[backfill] fetching Gong calls/extensive for {len(call_ids)} "
+            f"call IDs (in batches of {_GONG_BATCH_SIZE})...",
+            file=sys.stderr,
+        )
+        gong_by_id: dict[str, dict] = {}
+        for i in range(0, len(call_ids), _GONG_BATCH_SIZE):
+            chunk = call_ids[i : i + _GONG_BATCH_SIZE]
+            gong_by_id.update(fetch_calls_extensive(call_ids=chunk))
+        print(f"  got {len(gong_by_id)} Gong calls back", file=sys.stderr)
+
         totals = {
             "pages_seen": 0,
             "pages_updated": 0,
-            "agencies_added": 0,
+            "agencies_changed": 0,
+            "purpose_changed": 0,
             "staff_added": 0,
             "new_staff": 0,
-            "pages_no_emails": 0,
-            "pages_no_toggle": 0,
+            "roles_added": 0,
+            "pages_no_gong_id": len(pages_without_gong_id),
+            "pages_no_gong_call": 0,
             "pages_errored": 0,
             "pages_noop": 0,
         }
-        no_toggle_pages: list[tuple[str, str]] = []
 
         for page in pages:
             totals["pages_seen"] += 1
             page_id = page.get("id", "")
-            page_url = page.get("url", "")
             props = page.get("properties") or {}
-            title = _read_title(props.get("Conversation Title") or props.get("Contact title"))
+            title = _read_title(props.get("Conversation Title"))
             existing_agency_ids = _relation_ids(props.get("Agencies"))
             existing_staff_ids = _relation_ids(props.get("Agency Staff"))
+            existing_purpose = _multi_select_values(props.get("Purpose"))
+
+            cid = page_call_ids.get(page_id)
+            if not cid:
+                print(f"  - {title} — no Gong ID in Link to source", file=sys.stderr)
+                continue
+
+            call = gong_by_id.get(cid)
+            if not call:
+                totals["pages_no_gong_call"] += 1
+                print(f"  - {title} — Gong call {cid} not returned", file=sys.stderr)
+                continue
+
             try:
-                toggle_present, participants = extract_participants_emails(notion, page_id)
-                if not toggle_present:
-                    totals["pages_no_toggle"] += 1
-                    no_toggle_pages.append((title, page_url))
-                    print(f"  - {title} — no Participants toggle", file=sys.stderr)
-                    continue
-                external = [
-                    p
-                    for p in participants
-                    if extract_domain(p.get("email")) != INTERNAL_DOMAIN
-                ]
-                if not external:
-                    totals["pages_no_emails"] += 1
-                    print(f"  - {title} — Participants toggle empty / internal-only", file=sys.stderr)
-                    continue
+                external = gong_external_people(call.get("participants", []))
                 resolution = resolve_call_links(
-                    notion, external, caches, dry_run=args.dry_run
+                    notion,
+                    external,
+                    caches,
+                    sf_account_ids=call.get("salesforce_account_ids", []),
+                    dry_run=args.dry_run,
                 )
                 result = apply_to_page(
                     notion,
@@ -508,17 +556,31 @@ def cmd_backfill_agency_and_staff(args: argparse.Namespace) -> int:
                     staff_ids=resolution.staff_ids,
                     existing_agency_ids=existing_agency_ids,
                     existing_staff_ids=existing_staff_ids,
+                    purpose=call.get("purpose"),
+                    existing_purpose=existing_purpose,
+                    overwrite_agencies=True,
+                    overwrite_purpose=True,
                     dry_run=args.dry_run,
                 )
-                if result["agencies_added"] or result["staff_added"]:
+                changed = (
+                    result["agencies_changed"]
+                    or result["staff_added"]
+                    or result["purpose_changed"]
+                    or resolution.roles_updated
+                )
+                if changed:
                     totals["pages_updated"] += 1
-                    totals["agencies_added"] += result["agencies_added"]
+                    totals["agencies_changed"] += result["agencies_changed"]
+                    totals["purpose_changed"] += result["purpose_changed"]
                     totals["staff_added"] += result["staff_added"]
                     totals["new_staff"] += len(resolution.new_staff)
+                    totals["roles_added"] += resolution.roles_updated
                     print(
-                        f"  - {title} — +{result['agencies_added']} agencies, "
-                        f"+{result['staff_added']} staff "
-                        f"({len(resolution.new_staff)} new)",
+                        f"  - {title} — "
+                        f"agencies {'overwrite' if result['agencies_changed'] else 'keep'}, "
+                        f"purpose {'overwrite' if result['purpose_changed'] else 'keep'}, "
+                        f"+{result['staff_added']} staff ({len(resolution.new_staff)} new), "
+                        f"+{resolution.roles_updated} roles",
                         file=sys.stderr,
                     )
                 else:
@@ -531,22 +593,24 @@ def cmd_backfill_agency_and_staff(args: argparse.Namespace) -> int:
                 )
 
     print("")
-    print("Backfill Agency + Staff fill report")
-    print(f"  Window (Created): {from_iso} → {to_iso}")
-    print(f"  Dry run:          {'yes' if args.dry_run else 'no'}")
-    print(f"  Candidates seen:  {totals['pages_seen']}")
-    print(f"  Pages updated:    {totals['pages_updated']}")
-    print(f"  No-op pages:      {totals['pages_noop']}")
-    print(f"  Pages w/o emails: {totals['pages_no_emails']}")
-    print(f"  Pages w/o toggle: {totals['pages_no_toggle']}")
-    print(f"  Pages errored:    {totals['pages_errored']}")
-    print(f"  Agency links +:   {totals['agencies_added']}")
-    print(f"  Staff links +:    {totals['staff_added']}")
-    print(f"  New Staff rows:   {totals['new_staff']}")
-    if no_toggle_pages:
+    print("Backfill Agency + Staff + Purpose + Role report")
+    print(f"  Window (Created):   {from_iso} → {to_iso}")
+    print(f"  Dry run:            {'yes' if args.dry_run else 'no'}")
+    print(f"  Candidates seen:    {totals['pages_seen']}")
+    print(f"  Pages updated:      {totals['pages_updated']}")
+    print(f"  No-op pages:        {totals['pages_noop']}")
+    print(f"  Pages w/o Gong ID:  {totals['pages_no_gong_id']}")
+    print(f"  Pages no Gong call: {totals['pages_no_gong_call']}")
+    print(f"  Pages errored:      {totals['pages_errored']}")
+    print(f"  Agencies changed:   {totals['agencies_changed']}")
+    print(f"  Purpose changed:    {totals['purpose_changed']}")
+    print(f"  Staff links +:      {totals['staff_added']}")
+    print(f"  New Staff rows:     {totals['new_staff']}")
+    print(f"  Roles filled:       {totals['roles_added']}")
+    if pages_without_gong_id:
         print("")
-        print(f"Pages missing Participants toggle ({len(no_toggle_pages)}):")
-        for title, url in no_toggle_pages:
+        print(f"Pages without a Gong call ID in Link to source ({len(pages_without_gong_id)}):")
+        for title, url in pages_without_gong_id:
             print(f"  {url}  {title}")
     return 1 if totals["pages_errored"] else 0
 
@@ -652,6 +716,147 @@ def cmd_seed_agency_domains(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# seed-agency-domains-from-website
+# ---------------------------------------------------------------------------
+
+
+def cmd_seed_agency_domains_from_website(args: argparse.Namespace) -> int:
+    """Derive Email Domains for each Agency from its Website URL.
+
+    The Website field is read-only here — we only derive a normalized host
+    and, if safe, append it to the Email Domains multi_select. Collisions
+    (multiple Agencies whose Websites normalize to the same host) and
+    cross-claims (derived host already listed as a domain on a different
+    Agency) are reported and left for human review, not auto-written.
+    """
+    notion_token = _require_env("NOTION_TOKEN")
+
+    with NotionClient(notion_token) as notion:
+        print("[seed-website] loading Agencies...", file=sys.stderr)
+        agencies = notion.query_data_source(AGENCIES_DATA_SOURCE_ID)
+
+        agency_names: dict[str, str] = {}
+        agency_websites: dict[str, str] = {}
+        existing_domains: dict[str, set[str]] = {}
+        for a in agencies:
+            aid = a.get("id", "")
+            if not aid:
+                continue
+            props = a.get("properties") or {}
+            agency_names[aid] = _read_title(props.get("Name"))
+            website_prop = props.get("Website") or {}
+            url = (website_prop.get("url") or "").strip()
+            if url:
+                agency_websites[aid] = url
+            existing_domains[aid] = {
+                d.lower()
+                for d in _multi_select_values(props.get("Email Domains"))
+                if d
+            }
+
+        print(
+            f"  {len(agencies)} agencies, {len(agency_websites)} with a Website",
+            file=sys.stderr,
+        )
+
+        derived: dict[str, str] = {}
+        unparseable: list[tuple[str, str]] = []  # (name, url)
+        domain_claims: dict[str, list[str]] = {}  # host -> [agency_ids]
+        for aid, url in agency_websites.items():
+            host = domain_from_url(url)
+            if not host or host in FREE_MAIL_DOMAINS or host == INTERNAL_DOMAIN:
+                unparseable.append((agency_names[aid], url))
+                continue
+            derived[aid] = host
+            domain_claims.setdefault(host, []).append(aid)
+
+        other_claims: dict[str, set[str]] = {}
+        for aid, domains in existing_domains.items():
+            for d in domains:
+                other_claims.setdefault(d, set()).add(aid)
+
+        planned: list[tuple[str, str, str]] = []        # (aid, name, host)
+        already_set: list[tuple[str, str]] = []         # (name, host)
+        cross_claimed: list[tuple[str, str, list[str]]] = []  # (name, host, other_names)
+        for aid, host in derived.items():
+            name = agency_names[aid]
+            if len(domain_claims[host]) > 1:
+                continue  # collision handled below
+            if host in existing_domains.get(aid, set()):
+                already_set.append((name, host))
+                continue
+            others = other_claims.get(host, set()) - {aid}
+            if others:
+                cross_claimed.append(
+                    (name, host, sorted(agency_names[x] for x in others))
+                )
+                continue
+            planned.append((aid, name, host))
+
+        collisions: list[tuple[str, list[str]]] = []
+        for host, aids in domain_claims.items():
+            if len(aids) > 1:
+                collisions.append(
+                    (host, sorted(agency_names[x] for x in aids))
+                )
+
+        print("")
+        print(
+            f"Seed Email Domains from Website — {'DRY RUN' if args.dry_run else 'APPLY'}"
+        )
+        print(f"  Agencies with a Website:     {len(agency_websites)}")
+        print(f"  Unparseable / free-mail:     {len(unparseable)}")
+        print(f"  Collisions (>1 Agency):      {len(collisions)}")
+        print(f"  Cross-claimed elsewhere:     {len(cross_claimed)}")
+        print(f"  Already set on this Agency:  {len(already_set)}")
+        print(f"  To write:                    {len(planned)}")
+
+        if planned:
+            print("")
+            print("Planned additions:")
+            for _, name, host in planned:
+                print(f"  + {name}: {host}")
+        if collisions:
+            print("")
+            print("Collisions — Website normalized to a shared host, needs review:")
+            for host, names in collisions:
+                print(f"  {host}: {', '.join(names)}")
+        if cross_claimed:
+            print("")
+            print("Cross-claimed — host already on a different Agency, needs review:")
+            for name, host, others in cross_claimed:
+                print(f"  {name} → {host}  (also on: {', '.join(others)})")
+        if unparseable:
+            print("")
+            print("Websites that didn't yield a usable host:")
+            for name, url in unparseable:
+                print(f"  {name}: {url!r}")
+
+        if args.dry_run or not planned:
+            return 0
+
+        print("")
+        print("Writing...", file=sys.stderr)
+        errors = 0
+        for aid, name, host in planned:
+            combined = sorted(existing_domains.get(aid, set()) | {host})
+            try:
+                notion.update_page(
+                    aid,
+                    {
+                        "Email Domains": {
+                            "multi_select": [{"name": d} for d in combined]
+                        }
+                    },
+                )
+            except Exception as e:
+                errors += 1
+                print(f"  ! {name}: {type(e).__name__}: {e}", file=sys.stderr)
+        print(f"Done. {len(planned) - errors} updated, {errors} errored.")
+        return 1 if errors else 0
+
+
+# ---------------------------------------------------------------------------
 # Local tiny readers (avoid importing the lot from agency_and_staff_fill)
 # ---------------------------------------------------------------------------
 
@@ -685,7 +890,12 @@ def _multi_select_values(prop: dict | None) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-_KNOWN_SUBCOMMANDS = {"run", "backfill-agency-and-staff", "seed-agency-domains"}
+_KNOWN_SUBCOMMANDS = {
+    "run",
+    "backfill-agency-and-staff",
+    "seed-agency-domains",
+    "seed-agency-domains-from-website",
+}
 
 
 def main() -> int:
@@ -714,6 +924,14 @@ def main() -> int:
         "--dry-run", action="store_true", help="Print plan without writing."
     )
 
+    seed_web_p = sub.add_parser(
+        "seed-agency-domains-from-website",
+        help="Derive Email Domains on each Agency from its Website URL.",
+    )
+    seed_web_p.add_argument(
+        "--dry-run", action="store_true", help="Print plan without writing."
+    )
+
     # Back-compat: if no subcommand given, treat as 'run' (unless user is
     # asking for top-level help).
     argv = sys.argv[1:]
@@ -729,6 +947,8 @@ def main() -> int:
         return cmd_backfill_agency_and_staff(args)
     if args.command == "seed-agency-domains":
         return cmd_seed_agency_domains(args)
+    if args.command == "seed-agency-domains-from-website":
+        return cmd_seed_agency_domains_from_website(args)
     parser.print_help()
     return 2
 

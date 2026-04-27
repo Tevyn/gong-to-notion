@@ -83,6 +83,11 @@ def build_properties(
     }
     if summary:
         props["Summary"] = {"rich_text": _rich_text_runs(summary)}
+
+    purpose = (call.get("purpose") or "").strip()
+    if purpose:
+        props["Purpose"] = {"multi_select": [{"name": purpose}]}
+
     return props
 
 
