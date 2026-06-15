@@ -26,6 +26,18 @@ class FailedRow:
 
 
 @dataclass
+class GapRow:
+    """A created call that's missing something a human should fix.
+
+    `details` is a free-form list of one-line strings explaining what
+    (e.g. unresolved SF Account IDs, attendee domains with no Agency).
+    """
+    title: str
+    notion_url: str
+    details: list[str] = field(default_factory=list)
+
+
+@dataclass
 class RunReport:
     window_start: str
     window_end: str
@@ -36,6 +48,9 @@ class RunReport:
     created: list[CreatedRow] = field(default_factory=list)
     skipped: list[SkippedRow] = field(default_factory=list)
     failed: list[FailedRow] = field(default_factory=list)
+    no_agency: list[GapRow] = field(default_factory=list)
+    no_staff: list[GapRow] = field(default_factory=list)
+    no_purpose: list[GapRow] = field(default_factory=list)
 
     def format(self) -> str:
         lines = [
@@ -64,4 +79,30 @@ class RunReport:
             lines.append("Failed:")
             for f in self.failed:
                 lines.append(f"  - {f.title} — {f.error_class}: {f.message}")
+
+        gap_total = len(self.no_agency) + len(self.no_staff) + len(self.no_purpose)
+        if gap_total:
+            lines.append("")
+            lines.append(
+                f"Gaps in created pages ({gap_total} — flagged for human follow-up):"
+            )
+            if self.no_agency:
+                lines.append(f"  No Agency linked ({len(self.no_agency)}):")
+                for g in self.no_agency:
+                    lines.append(f"    - {g.title} — {g.notion_url}")
+                    for d in g.details:
+                        lines.append(f"        {d}")
+            if self.no_staff:
+                lines.append(f"  No Agency Staff linked ({len(self.no_staff)}):")
+                for g in self.no_staff:
+                    lines.append(f"    - {g.title} — {g.notion_url}")
+                    for d in g.details:
+                        lines.append(f"        {d}")
+            if self.no_purpose:
+                lines.append(
+                    f"  No Purpose set ({len(self.no_purpose)} — run customer-interactions-judgment-fill):"
+                )
+                for g in self.no_purpose:
+                    lines.append(f"    - {g.title} — {g.notion_url}")
+
         return "\n".join(lines)

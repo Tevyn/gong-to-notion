@@ -29,6 +29,7 @@ from .agency_and_staff_fill import (
     extract_domain,
     gong_external_people,
     load_fill_caches,
+    normalize_sf_account_id,
     resolve_call_links,
 )
 from .gong_client import fetch_calls_extensive, fetch_transcripts
@@ -41,7 +42,7 @@ from .mapping import (
     resolve_facilitator_email,
 )
 from .notion_client import NotionClient, NotionError
-from .report import CreatedRow, FailedRow, RunReport, SkippedRow
+from .report import CreatedRow, FailedRow, GapRow, RunReport, SkippedRow
 
 _ROOT = Path(__file__).resolve().parents[2]
 
@@ -138,6 +139,84 @@ def drop_private(calls: list[dict]) -> tuple[list[dict], int]:
 # Per-call processing
 # ---------------------------------------------------------------------------
 
+
+def _record_gaps(
+    *,
+    report: RunReport,
+    title: str,
+    notion_url: str,
+    call: dict,
+    external: list[dict],
+    sf_ids: list[str],
+    resolution,
+    fill_caches,
+) -> None:
+    """Append GapRows to `report` for any actionable hole on this just-created
+    call: no Agency, no Agency Staff, no Purpose. Each row carries one-line
+    detail strings explaining what we couldn't resolve so the human knows
+    where to look (which SF Account ID is missing from Notion, which attendee
+    domain has no Agency, etc.)."""
+
+    # No Agency — list unresolved SF IDs and unresolved attendee domains.
+    if not resolution.agency_ids:
+        details: list[str] = []
+        unresolved_sf = [
+            normalize_sf_account_id(s) or s
+            for s in sf_ids
+            if normalize_sf_account_id(s)
+            and normalize_sf_account_id(s) not in fill_caches.sf_account_to_agency
+        ]
+        if unresolved_sf:
+            details.append(
+                f"SF Account IDs not in Notion: {', '.join(sorted(set(unresolved_sf)))}"
+            )
+        elif sf_ids:
+            details.append("Gong provided no SF Account ID for this call")
+        else:
+            details.append("Gong provided no SF Account ID for this call")
+
+        unresolved_domains: set[str] = set()
+        for p in external:
+            email = (p.get("email") or "").strip().lower()
+            if not email:
+                continue
+            d = extract_domain(email)
+            if not d or d == INTERNAL_DOMAIN or d in FREE_MAIL_DOMAINS:
+                continue
+            if d not in fill_caches.domain_to_agency:
+                unresolved_domains.add(d)
+        if unresolved_domains:
+            details.append(
+                f"attendee domains with no Agency: {', '.join(sorted(unresolved_domains))}"
+            )
+        report.no_agency.append(
+            GapRow(title=title, notion_url=notion_url, details=details)
+        )
+
+    # No Agency Staff but external attendees were present — surface so
+    # human can investigate (usually means attendees had no email or all
+    # were filtered as internal/free-mail).
+    has_external_with_email = any(
+        (p.get("email") or "").strip()
+        and extract_domain((p.get("email") or "").strip().lower()) not in (None, INTERNAL_DOMAIN)
+        for p in external
+    )
+    if not resolution.staff_ids and has_external_with_email:
+        report.no_staff.append(
+            GapRow(
+                title=title,
+                notion_url=notion_url,
+                details=[
+                    f"{len(external)} external attendees but none became Agency Staff",
+                ],
+            )
+        )
+
+    # No Purpose — Gong didn't provide one.
+    if not (call.get("purpose") or "").strip():
+        report.no_purpose.append(GapRow(title=title, notion_url=notion_url))
+
+
 def process_call(
     call: dict,
     notion: NotionClient,
@@ -230,11 +309,12 @@ def process_call(
         if fill_caches is not None:
             try:
                 external = gong_external_people(call.get("participants", []))
+                sf_ids = call.get("salesforce_account_ids", []) or []
                 resolution = resolve_call_links(
                     notion,
                     external,
                     fill_caches,
-                    sf_account_ids=call.get("salesforce_account_ids", []),
+                    sf_account_ids=sf_ids,
                     dry_run=False,
                 )
                 apply_to_page(
@@ -245,6 +325,16 @@ def process_call(
                     existing_agency_ids=[],  # freshly created page — fields are blank
                     existing_staff_ids=[],
                     dry_run=False,
+                )
+                _record_gaps(
+                    report=report,
+                    title=title,
+                    notion_url=page.get("url", ""),
+                    call=call,
+                    external=external,
+                    sf_ids=sf_ids,
+                    resolution=resolution,
+                    fill_caches=fill_caches,
                 )
             except Exception as fill_err:
                 print(

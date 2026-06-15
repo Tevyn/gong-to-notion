@@ -51,6 +51,47 @@ uv run python -m gong_to_notion --since 7d --dry-run --dump run.json
 
 `--since` accepts `Nd` or `Nh` and is mutually exclusive with `--start`/`--end`. Exit code is `1` if any page fails to create, else `0`.
 
+After creating each page, `run` also performs the deterministic Agency + Agency Staff fill (resolving Agencies by Salesforce Account ID, then by participant email domain, and creating Staff rows as needed). Pass `--skip-fill` to disable it.
+
+### Run report and gaps
+
+At the end of a run the report lists Created / Already existed / Failed, plus a **"Gaps in created pages"** section flagging rows a human should follow up on: no Agency linked, no Agency Staff linked, or no Purpose set. Each gap line explains what couldn't be resolved (e.g. an SF Account ID not present in Notion, or attendee domains with no matching Agency). The Purpose gaps are filled by the `customer-interactions-judgment-fill` skill (an LLM pass), not by this CLI.
+
 ## Filtering
 
 External-customer filtering and private-call exclusion are automatic: only calls with at least one `External`-affiliated participant are kept, and calls flagged private in Gong are dropped before anything is written to Notion.
+
+## Subcommands
+
+`run` is the default and is assumed when no subcommand is given. The others maintain the Agencies / Agency Staff side of the database:
+
+```sh
+# Deterministic Agency/Staff/Purpose fill over existing Customer Interactions pages.
+uv run python -m gong_to_notion backfill-agency-and-staff --since 30d [--dry-run]
+
+# Derive each Agency's Email Domains from its existing Staff emails.
+uv run python -m gong_to_notion seed-agency-domains [--dry-run]
+
+# Derive each Agency's Email Domains from its Website URL.
+uv run python -m gong_to_notion seed-agency-domains-from-website [--dry-run]
+```
+
+All three support `--dry-run` to print a plan without writing.
+
+## scripts/
+
+`scripts/` holds one-off migration and diagnostic tools that are not part of the importer's normal operation:
+
+- `fill_agency_account_ids.py`: upsert Agencies from a Salesforce Accounts Report xlsx (needs the `scripts` extra).
+- `seed_agency_domains_from_calls.py`: seed Agency Email Domains from observed call attendance.
+- `fill_staff_agency_by_domain.py`: backfill blank `Agency` relations on Staff rows by email domain.
+- `check_staff_duplicates.py`: read-only report of duplicate Agency Staff rows.
+
+The xlsx importer needs `openpyxl`, declared as an optional dependency:
+
+```sh
+uv sync --extra scripts
+uv run --extra scripts python scripts/fill_agency_account_ids.py PATH.xlsx --apply
+```
+
+Run the others from the repo root, e.g. `uv run python scripts/check_staff_duplicates.py`.

@@ -8,6 +8,11 @@ dependencies = [
     "python-dotenv>=1.0",
 ]
 
+[project.optional-dependencies]
+# One-off tools under scripts/ (notably the SFDC xlsx importer). The core
+# importer doesn't need these; install with `uv sync --extra scripts`.
+scripts = ["openpyxl>=3.1"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

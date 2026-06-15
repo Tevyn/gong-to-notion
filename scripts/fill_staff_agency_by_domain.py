@@ -6,9 +6,9 @@ matching agency (if any). Blanks-only — never overwrites an existing
 Agency. Free-mail (gmail/yahoo/...) and internal (goswift.ly) domains
 are skipped, since neither uniquely identifies an Agency.
 
-Run:
-    uv run python fill_staff_agency_by_domain.py --dry-run
-    uv run python fill_staff_agency_by_domain.py
+Run (from the repo root):
+    uv run python scripts/fill_staff_agency_by_domain.py --dry-run
+    uv run python scripts/fill_staff_agency_by_domain.py
 """
 
 from __future__ import annotations
@@ -20,6 +20,10 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+# This script lives in scripts/; add the repo root to sys.path so the
+# `src...` imports resolve when run as `uv run python scripts/<name>.py`.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from src.gong_to_notion.agency_and_staff_fill import (
     AGENCY_STAFF_DATA_SOURCE_ID,
     FREE_MAIL_DOMAINS,
@@ -29,7 +33,7 @@ from src.gong_to_notion.agency_and_staff_fill import (
 )
 from src.gong_to_notion.notion_client import NotionClient
 
-_ROOT = Path(__file__).resolve().parent
+_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _read_title(prop: dict | None) -> str:

@@ -14,9 +14,9 @@ Skipped:
 Output is a proposal list. `--apply` writes the additions; without it, the
 script is read-only.
 
-Run:
-    uv run python seed_agency_domains_from_calls.py --dry-run
-    uv run python seed_agency_domains_from_calls.py --apply
+Run (from the repo root):
+    uv run python scripts/seed_agency_domains_from_calls.py --dry-run
+    uv run python scripts/seed_agency_domains_from_calls.py --apply
 """
 
 from __future__ import annotations
@@ -29,6 +29,10 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+# This script lives in scripts/; add the repo root to sys.path so the
+# `src...` imports resolve when run as `uv run python scripts/<name>.py`.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from src.gong_to_notion.agency_and_staff_fill import (
     AGENCIES_DATA_SOURCE_ID,
     AGENCY_STAFF_DATA_SOURCE_ID,
@@ -38,7 +42,7 @@ from src.gong_to_notion.agency_and_staff_fill import (
 )
 from src.gong_to_notion.notion_client import NotionClient
 
-_ROOT = Path(__file__).resolve().parent
+_ROOT = Path(__file__).resolve().parents[1]
 
 CONVERSATIONS_DATA_SOURCE_ID = "c9db2d38-cf18-4758-985a-99aadc826665"
 
@@ -87,6 +91,27 @@ APPROVED_DOMAINS: frozenset[str] = frozenset(
         "seatransit.org",
         "tcatmail.com",
         "phoenix.gov",
+        "clallamtransit.com",
+        "okc.gov",
+        "transitchicago.com",
+        "pvtransit.com",
+        "scrtd.org",
+        "go-metro.com",
+        "sartaonline.com",
+        "sjrtd.com",
+        "kmetro.com",
+        "basintransit.com",
+        "elpasotexas.gov",
+        "cityofws.org",
+        "brandon.ca",
+        "uci.edu",
+        "cathaytransportation.com",
+        "tms.com",
+        "infodev.ca",
+        "miovision.com",
+        "rlcontrols.com",
+        "tatecomputersystems.com",
+        "iris-sensing.com",
     }
 )
 
