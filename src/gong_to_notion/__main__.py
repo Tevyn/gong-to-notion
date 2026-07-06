@@ -395,6 +395,11 @@ def _add_backfill_args(p: argparse.ArgumentParser) -> None:
         type=int,
         help="Optional cap on candidate pages processed (for smoke tests).",
     )
+    p.add_argument(
+        "--only-missing-agency",
+        action="store_true",
+        help="Only process pages whose Agencies relation is empty.",
+    )
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -558,6 +563,10 @@ def cmd_backfill_agency_and_staff(args: argparse.Namespace) -> int:
                 {"property": "Format", "select": {"equals": "Gong Recording"}},
             ]
         }
+        if args.only_missing_agency:
+            filter_payload["and"].append(
+                {"property": "Agencies", "relation": {"is_empty": True}}
+            )
         print("[backfill] querying candidate pages...", file=sys.stderr)
         pages = notion.query_data_source(
             data_source_id,

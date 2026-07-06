@@ -1,21 +1,28 @@
 """Upsert Notion Agencies from an SFDC Accounts Report xlsx.
 
-Matches xlsx rows to existing Notion Agencies by normalized Account Name
-(reusing alias-aware normalization), and:
+Matches xlsx rows to existing Notion Agencies by SF Account ID (preferred)
+or normalized Account Name (alias-aware), and:
   - On matched pages, fills any of the supported properties that are blank
-    in Notion. Never overwrites a non-empty value.
+    in Notion. With --update, also overwrites values that differ from the
+    xlsx (SF is the source of truth); xlsx blanks never clear a Notion value.
+    The page title is never written on matched pages — mismatches between
+    the Notion title and the SF Account Name are reported only.
   - On unmatched xlsx rows, optionally CREATES a new Agency page with
     Name, Account ID, Account Stage, Classification, and any other
-    supported columns present in the row.
+    supported columns present in the row. --create-stages limits creation
+    to rows whose Account Stage is in the given comma-separated list.
+  - Derives the Salesforce Link URL from the Account ID.
+  - Links Parent Agency from the "Parent Account ID" column in a second
+    pass (so parents created in the same run resolve).
 
 Default mode is dry-run; pass --apply to actually write. Pass --no-create
-to skip creating new pages (updates only). Conflicts (existing value differs
-from xlsx) are logged, never clobbered.
+to skip creating new pages (updates only). Without --update, conflicts
+(existing value differs from xlsx) are logged, never clobbered.
 
 Run (from the repo root; needs the `scripts` extra for openpyxl):
     uv run --extra scripts python scripts/fill_agency_account_ids.py PATH.xlsx
-    uv run --extra scripts python scripts/fill_agency_account_ids.py PATH.xlsx --apply
-    uv run --extra scripts python scripts/fill_agency_account_ids.py PATH.xlsx --apply --no-create
+    uv run --extra scripts python scripts/fill_agency_account_ids.py PATH.xlsx --update
+    uv run --extra scripts python scripts/fill_agency_account_ids.py PATH.xlsx --update --apply --create-stages "Won,Engaged"
 """
 
 from __future__ import annotations
@@ -135,7 +142,17 @@ COLUMN_MAPPINGS: list[ColMap] = [
         "Partners Integrated with Swiftly API",
         "select",
     ),
+    ColMap("Current CAD / AVL Vendor", "CAD/AVL System", "select"),
+    ColMap("Current RTPI Provider", "Current RTPI Provider", "select"),
+    ColMap("Scheduling Software", "Scheduling Software", "select"),
+    ColMap("Organizational Type", "Organizational Type", "select"),
+    ColMap("Website", "Website", "url"),
+    ColMap("Number of Routes", "Routes", "number"),
+    ColMap("Fixed Route Fleet Size", "Fleet Size", "number"),
 ]
+
+# Non-ColMap column consumed by the parent-linking second pass.
+PARENT_ID_COL = "Parent Account ID"
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +177,28 @@ def transform_market_segment(raw: str) -> str:
 COLUMN_TRANSFORMS: dict[str, callable] = {
     "Market Segment": transform_market_segment,
 }
+
+
+_SF_ID_SUFFIX_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"
+
+
+def sf_id_15_to_18(sf_id_15: str) -> str:
+    """Standard Salesforce 15→18 char ID conversion (case-safe checksum)."""
+    suffix = ""
+    for chunk_start in (0, 5, 10):
+        chunk = sf_id_15[chunk_start : chunk_start + 5]
+        bits = sum(
+            1 << i for i, ch in enumerate(chunk) if ch.isalpha() and ch.isupper()
+        )
+        suffix += _SF_ID_SUFFIX_CHARS[bits]
+    return sf_id_15 + suffix
+
+
+def sf_account_url(sf_id_15: str) -> str:
+    return (
+        "https://goswiftly.lightning.force.com/lightning/r/Account/"
+        f"{sf_id_15_to_18(sf_id_15)}/view"
+    )
 
 
 def bucket_classification(stage: str) -> str | None:
@@ -262,9 +301,22 @@ def parse_accounts_xlsx_full(path: Path) -> tuple[list[dict[str, Any]], dict[str
 
     # Index columns we recognize
     col_to_idx: dict[str, int] = {}
-    for col in [HEADER_SENTINEL, "Account Owner", *(m.xlsx_col for m in COLUMN_MAPPINGS)]:
+    expected = [
+        HEADER_SENTINEL,
+        "Account Owner",
+        PARENT_ID_COL,
+        *(m.xlsx_col for m in COLUMN_MAPPINGS),
+    ]
+    for col in expected:
         if col in header:
             col_to_idx[col] = header.index(col)
+    missing = [c for c in expected if c not in col_to_idx]
+    if missing:
+        print(
+            f"[xlsx] WARN: expected columns missing from export (skipped): "
+            f"{', '.join(missing)}",
+            file=sys.stderr,
+        )
 
     # Account Stage is required for bucketing — fail loudly if missing.
     if "Account Stage" not in col_to_idx:
@@ -299,6 +351,8 @@ def parse_accounts_xlsx_full(path: Path) -> tuple[list[dict[str, Any]], dict[str
             if col in (HEADER_SENTINEL, "Account ID"):
                 continue
             v = row[idx] if idx < len(row) else None
+            if col == PARENT_ID_COL:
+                v = normalize_sf_account_id(("" if v is None else str(v)).strip())
             record[col] = v
 
         if record.get("Account Owner"):
@@ -338,6 +392,18 @@ def _read_multi_select(prop: dict | None) -> list[str]:
     if not prop:
         return []
     return [o.get("name") or "" for o in (prop.get("multi_select") or []) if o.get("name")]
+
+
+def _read_url(prop: dict | None) -> str:
+    if not prop:
+        return ""
+    return (prop.get("url") or "").strip()
+
+
+def _read_relation_ids(prop: dict | None) -> list[str]:
+    if not prop:
+        return []
+    return [r.get("id") or "" for r in (prop.get("relation") or []) if r.get("id")]
 
 
 def _read_number(prop: dict | None) -> float | None:
@@ -392,6 +458,14 @@ def _date_payload(iso: str) -> dict:
     return {"date": {"start": iso}}
 
 
+def _url_payload(value: str) -> dict:
+    return {"url": value}
+
+
+def _relation_payload(page_ids: list[str]) -> dict:
+    return {"relation": [{"id": pid} for pid in page_ids]}
+
+
 # ---------------------------------------------------------------------------
 # Schema lookup (option validation for select/multi_select)
 # ---------------------------------------------------------------------------
@@ -435,14 +509,24 @@ def infer_schema_from_pages(pages: list[dict]) -> SchemaInfo:
 
 @dataclass
 class RowDelta:
-    """Holds the desired property values for a single xlsx row, plus a
-    breakdown of which made it through select-option validation."""
+    """Holds the desired property values for a single xlsx row, plus the
+    select/multi-select values not yet seen as options in Notion (written
+    anyway — Notion auto-creates options — but reported for tidy-up)."""
     name: str
     sf_id: str
     desired: dict[str, dict] = field(default_factory=dict)
     classification: str | None = None
-    skipped_select: list[tuple[str, str]] = field(default_factory=list)  # (prop, value)
-    skipped_multi_values: list[tuple[str, str]] = field(default_factory=list)
+    new_select_options: list[tuple[str, str]] = field(default_factory=list)  # (prop, value)
+    new_multi_options: list[tuple[str, str]] = field(default_factory=list)
+
+
+def _canon_option(known: set[str], value: str) -> str | None:
+    """Return the existing option whose name matches case-insensitively."""
+    lower = value.lower()
+    for opt in known:
+        if opt.lower() == lower:
+            return opt
+    return None
 
 
 def build_row_delta(record: dict[str, Any], schema: SchemaInfo) -> RowDelta:
@@ -472,15 +556,18 @@ def build_row_delta(record: dict[str, Any], schema: SchemaInfo) -> RowDelta:
             if raw is None:
                 continue
             s = str(raw).strip()
-            if not s:
+            if not s or s.lower() == "no data":
                 continue
-            # Validate against known options for this property if we've seen any.
+            # Unknown options are written anyway (Notion auto-creates them);
+            # case-insensitive hits reuse the existing option's casing so
+            # 'INIT' doesn't create a near-dupe of 'Init'.
             known = schema.select_options.get(cm.notion_prop)
             if known is not None and s not in known:
-                # Special case: Account Stage is pre-seeded; if Notion has a
-                # different option set, log and skip.
-                delta.skipped_select.append((cm.notion_prop, s))
-                continue
+                canon = _canon_option(known, s)
+                if canon:
+                    s = canon
+                else:
+                    delta.new_select_options.append((cm.notion_prop, s))
             delta.desired[cm.notion_prop] = _select_payload(s)
 
         elif cm.kind == "multi_select":
@@ -490,12 +577,27 @@ def build_row_delta(record: dict[str, Any], schema: SchemaInfo) -> RowDelta:
             known = schema.multi_select_options.get(cm.notion_prop)
             kept: list[str] = []
             for p in parts:
-                if known is not None and p not in known:
-                    delta.skipped_multi_values.append((cm.notion_prop, p))
+                if p.lower() == "no data":
                     continue
+                if known is not None and p not in known:
+                    canon = _canon_option(known, p)
+                    if canon:
+                        p = canon
+                    else:
+                        delta.new_multi_options.append((cm.notion_prop, p))
                 kept.append(p)
             if kept:
                 delta.desired[cm.notion_prop] = _multi_select_payload(kept)
+
+        elif cm.kind == "url":
+            if raw is None:
+                continue
+            s = str(raw).strip()
+            if not s:
+                continue
+            if not s.lower().startswith(("http://", "https://")):
+                s = "https://" + s
+            delta.desired[cm.notion_prop] = _url_payload(s)
 
         elif cm.kind == "number":
             n = parse_number(raw)
@@ -517,68 +619,88 @@ def build_row_delta(record: dict[str, Any], schema: SchemaInfo) -> RowDelta:
             delta.classification = bucket
             delta.desired["Classification"] = _select_payload(bucket)
 
+    # Salesforce Link derived from the Account ID — no export column needed.
+    delta.desired["Salesforce Link"] = _url_payload(sf_account_url(sf_id))
+
     return delta
 
 
 # ---------------------------------------------------------------------------
-# Diffing — only write properties that are blank on the existing page
+# Diffing — blanks always fill; --update also overwrites differing values.
+# xlsx blanks never reach `desired`, so nothing here can clear a Notion value.
 # ---------------------------------------------------------------------------
 
 
-def filter_to_blanks(
-    desired: dict[str, dict], page_props: dict
-) -> tuple[dict[str, dict], list[tuple[str, str, str]]]:
-    """Return (updates_to_write, conflicts). Conflicts are
-    (prop_name, xlsx_value, notion_value) for non-blank existing values that
-    differ from the xlsx — never overwritten."""
+def _url_norm(u: str) -> str:
+    s = (u or "").strip().lower()
+    for prefix in ("https://", "http://"):
+        if s.startswith(prefix):
+            s = s[len(prefix):]
+    return s.rstrip("/")
+
+
+def diff_properties(
+    desired: dict[str, dict], page_props: dict, update_mode: bool
+) -> tuple[dict[str, dict], list[tuple[str, str, str]], list[tuple[str, str, str]]]:
+    """Return (updates_to_write, changes, conflicts).
+
+    `changes` are (prop_name, xlsx_value, notion_value) overwrites included in
+    `updates` because update_mode is on. `conflicts` are the same tuples when
+    update_mode is off — differing values reported, never written.
+    The page title is never diffed here; it's only used at create-time."""
     updates: dict[str, dict] = {}
+    changes: list[tuple[str, str, str]] = []
     conflicts: list[tuple[str, str, str]] = []
+
+    def resolve(prop_name: str, payload: dict, existing_blank: bool,
+                differs: bool, new_repr: str, old_repr: str) -> None:
+        if existing_blank:
+            updates[prop_name] = payload
+        elif differs:
+            if update_mode:
+                updates[prop_name] = payload
+                changes.append((prop_name, new_repr, old_repr))
+            else:
+                conflicts.append((prop_name, new_repr, old_repr))
 
     for prop_name, payload in desired.items():
         existing = page_props.get(prop_name)
-        prop_type = (existing or {}).get("type")
 
         if "rich_text" in payload:
             existing_val = _read_rich_text(existing)
             new_val = "".join(p["text"]["content"] for p in payload["rich_text"])
-            if _is_blank(existing_val):
-                updates[prop_name] = payload
-            elif existing_val != new_val:
-                conflicts.append((prop_name, new_val, existing_val))
+            resolve(prop_name, payload, _is_blank(existing_val),
+                    existing_val != new_val, new_val, existing_val)
         elif "select" in payload:
             existing_val = _read_select(existing)
             new_val = (payload["select"] or {}).get("name") or ""
-            if _is_blank(existing_val):
-                updates[prop_name] = payload
-            elif existing_val != new_val:
-                conflicts.append((prop_name, new_val, existing_val))
+            resolve(prop_name, payload, _is_blank(existing_val),
+                    existing_val != new_val, new_val, existing_val)
         elif "multi_select" in payload:
             existing_vals = _read_multi_select(existing)
             new_vals = [o["name"] for o in payload["multi_select"]]
-            if not existing_vals:
-                updates[prop_name] = payload
-            elif set(existing_vals) != set(new_vals):
-                conflicts.append(
-                    (prop_name, ", ".join(new_vals), ", ".join(existing_vals))
-                )
+            resolve(prop_name, payload, not existing_vals,
+                    set(existing_vals) != set(new_vals),
+                    ", ".join(new_vals), ", ".join(existing_vals))
         elif "number" in payload:
             existing_val = _read_number(existing)
             new_val = payload["number"]
-            if existing_val is None:
-                updates[prop_name] = payload
-            elif existing_val != new_val:
-                conflicts.append((prop_name, str(new_val), str(existing_val)))
+            resolve(prop_name, payload, existing_val is None,
+                    existing_val != new_val, str(new_val), str(existing_val))
         elif "date" in payload:
             existing_val = _read_date(existing)
             new_val = (payload["date"] or {}).get("start") or ""
-            if _is_blank(existing_val):
-                updates[prop_name] = payload
-            elif existing_val != new_val:
-                conflicts.append((prop_name, new_val, existing_val))
+            resolve(prop_name, payload, _is_blank(existing_val),
+                    existing_val != new_val, new_val, existing_val)
+        elif "url" in payload:
+            existing_val = _read_url(existing)
+            new_val = payload["url"]
+            # Scheme/trailing-slash differences are noise, not changes.
+            resolve(prop_name, payload, _is_blank(existing_val),
+                    _url_norm(existing_val) != _url_norm(new_val),
+                    new_val, existing_val)
 
-        # title is only used at create-time; skip on update path
-
-    return updates, conflicts
+    return updates, changes, conflicts
 
 
 # ---------------------------------------------------------------------------
@@ -604,7 +726,25 @@ def main() -> int:
         action="store_true",
         help="When --apply is set, only update existing Agencies; do not create new pages.",
     )
+    ap.add_argument(
+        "--update",
+        action="store_true",
+        help="Overwrite Notion values that differ from the xlsx (SF is the "
+        "source of truth). Default only fills blanks and reports conflicts.",
+    )
+    ap.add_argument(
+        "--create-stages",
+        help="Comma-separated Account Stages; only unmatched rows in these "
+        "stages get new pages (e.g. \"Won,Engaged,Early Stage\"). "
+        "Default: all stages.",
+    )
     args = ap.parse_args()
+
+    create_stages: set[str] | None = None
+    if args.create_stages:
+        create_stages = {
+            s.strip().lower() for s in args.create_stages.split(",") if s.strip()
+        }
 
     if not args.xlsx.exists():
         raise SystemExit(f"File not found: {args.xlsx}")
@@ -651,22 +791,26 @@ def main() -> int:
         update_writes: list[tuple[str, str, dict]] = []  # (page_id, name, props_payload)
         already_set_count = 0
         prop_fill_counts: Counter = Counter()
+        prop_change_counts: Counter = Counter()
+        all_changes: list[tuple[str, str, str, str]] = []  # (name, prop, xlsx_val, notion_val)
         all_conflicts: list[tuple[str, str, str, str]] = []  # (name, prop, xlsx_val, notion_val)
+        title_mismatches: list[tuple[str, str]] = []  # (notion_title, sf_name)
         ambiguous: list[tuple[str, list[str]]] = []
         unmatched_xlsx: list[dict[str, Any]] = []
         matched_pages: set[str] = set()
-        skipped_select_total: Counter = Counter()
-        skipped_multi_total: Counter = Counter()
+        record_page: dict[str, str] = {}  # xlsx Account ID → matched/created page id
+        new_select_total: Counter = Counter()
+        new_multi_total: Counter = Counter()
         bucket_counts: Counter = Counter()
         stage_counts: Counter = Counter()
 
         for record in xlsx_rows:
             stage_counts[str(record.get("Account Stage") or "").strip()] += 1
             delta = build_row_delta(record, schema)
-            for p, v in delta.skipped_select:
-                skipped_select_total[(p, v)] += 1
-            for p, v in delta.skipped_multi_values:
-                skipped_multi_total[(p, v)] += 1
+            for p, v in delta.new_select_options:
+                new_select_total[(p, v)] += 1
+            for p, v in delta.new_multi_options:
+                new_multi_total[(p, v)] += 1
             if delta.classification:
                 bucket_counts[delta.classification] += 1
 
@@ -701,14 +845,27 @@ def main() -> int:
                     continue
                 (pid,) = hits
             matched_pages.add(pid)
+            record_page[record["Account ID"]] = pid
+            # Name-matched pages get their Account ID filled this run; index
+            # them now so the parent-linking pass can resolve them.
+            sf_id_to_page.setdefault(record["Account ID"], pid)
             notion_name, notion_props = page_info[pid]
-            updates, conflicts = filter_to_blanks(delta.desired, notion_props)
+            if notion_name.strip() != record["Account Name"].strip():
+                title_mismatches.append((notion_name, record["Account Name"]))
+            updates, changes, conflicts = diff_properties(
+                delta.desired, notion_props, args.update
+            )
+            changed_props = {prop for prop, _, _ in changes}
+            for prop, xv, nv in changes:
+                all_changes.append((notion_name, prop, xv, nv))
+                prop_change_counts[prop] += 1
             for prop, xv, nv in conflicts:
                 all_conflicts.append((notion_name, prop, xv, nv))
             if updates:
                 update_writes.append((pid, notion_name, updates))
                 for prop in updates.keys():
-                    prop_fill_counts[prop] += 1
+                    if prop not in changed_props:
+                        prop_fill_counts[prop] += 1
             else:
                 already_set_count += 1
 
@@ -726,24 +883,87 @@ def main() -> int:
 
         # Apply creates
         creates_done: list[str] = []
-        creates_planned: list[tuple[str, dict]] = []  # (name, properties)
+        creates_planned: list[tuple[str, str]] = []  # (name, stage)
+        creates_skipped_by_stage: Counter = Counter()
+        would_create_ids: set[str] = set()  # xlsx Account IDs of planned creates (dry-run)
         if not args.no_create:
             for record in unmatched_xlsx:
+                stage = str(record.get("Account Stage") or "").strip()
+                if create_stages is not None and stage.lower() not in create_stages:
+                    creates_skipped_by_stage[stage or "(blank)"] += 1
+                    continue
+                if dry_run:
+                    would_create_ids.add(record["Account ID"])
                 delta = build_row_delta(record, schema)
                 props_payload: dict[str, dict] = {
                     "Name": _title_payload(record["Account Name"]),
                     **delta.desired,
                 }
-                creates_planned.append((record["Account Name"], props_payload))
+                creates_planned.append((record["Account Name"], stage or "(blank)"))
                 if not dry_run:
-                    notion.create_page(AGENCIES_DATA_SOURCE_ID, props_payload)
+                    created = notion.create_page(AGENCIES_DATA_SOURCE_ID, props_payload)
+                    if created.get("id"):
+                        record_page[record["Account ID"]] = created["id"]
+                        sf_id_to_page[record["Account ID"]] = created["id"]
                     creates_done.append(record["Account Name"])
                     print(f"  created {record['Account Name']!r}", file=sys.stderr)
+
+        # Second pass: Parent Agency links. Runs after creates so parents
+        # created in this run resolve. In dry-run, planned creates count as
+        # resolvable targets/children even though no page exists yet.
+        parent_links_planned = 0
+        parent_changes: list[tuple[str, str, str]] = []  # (child, old parent, new parent)
+        parent_conflicts: list[tuple[str, str, str]] = []
+        parent_unresolved: list[tuple[str, str]] = []  # (child name, parent sf id)
+        for record in xlsx_rows:
+            parent_sf = record.get(PARENT_ID_COL) or ""
+            if not parent_sf or parent_sf == record["Account ID"]:
+                continue
+            child_name = record["Account Name"]
+            parent_pid = sf_id_to_page.get(parent_sf)
+            parent_is_pending = dry_run and parent_sf in would_create_ids
+            if not parent_pid and not parent_is_pending:
+                parent_unresolved.append((child_name, parent_sf))
+                continue
+            child_pid = record_page.get(record["Account ID"])
+            child_is_pending = dry_run and record["Account ID"] in would_create_ids
+            if not child_pid and not child_is_pending:
+                continue  # child row neither matched nor being created
+            # Freshly created children (and dry-run pending ones) have no
+            # existing relation; matched pages might.
+            existing_parents: list[str] = []
+            if child_pid and child_pid in page_info:
+                existing_parents = _read_relation_ids(
+                    page_info[child_pid][1].get("Parent Agency")
+                )
+            if not existing_parents:
+                parent_links_planned += 1
+                if not dry_run and child_pid and parent_pid:
+                    notion.update_page(
+                        child_pid, {"Parent Agency": _relation_payload([parent_pid])}
+                    )
+            elif parent_pid and existing_parents != [parent_pid]:
+                old_names = ", ".join(
+                    page_info.get(p, ("<unknown>",))[0] for p in existing_parents
+                )
+                new_name = page_info.get(parent_pid, ("<new page>",))[0]
+                if args.update:
+                    parent_changes.append((child_name, old_names, new_name))
+                    if not dry_run and child_pid:
+                        notion.update_page(
+                            child_pid,
+                            {"Parent Agency": _relation_payload([parent_pid])},
+                        )
+                else:
+                    parent_conflicts.append((child_name, old_names, new_name))
 
     # -------- Report --------
     print("")
     print("=" * 78)
-    print(f"{'DRY-RUN — ' if dry_run else ''}Agency upsert from xlsx")
+    print(
+        f"{'DRY-RUN — ' if dry_run else ''}Agency upsert from xlsx"
+        f"{' (--update: overwrites enabled)' if args.update else ' (blanks-only)'}"
+    )
     print("=" * 78)
     print(f"  xlsx rows:           {len(xlsx_rows)}")
     print(f"  matched (existing):  {len(matched_pages)}")
@@ -752,6 +972,8 @@ def main() -> int:
         f"    {'would update' if dry_run else 'updated'}:      "
         f"{len(update_writes)}"
     )
+    if args.update:
+        print(f"    value overwrites:  {len(all_changes)}  (across those pages)")
     print(f"  unmatched xlsx:      {len(unmatched_xlsx)}  (no Agency with that name)")
     if args.no_create:
         print(f"    {'would create' if dry_run else 'created'}:      0  (--no-create)")
@@ -760,8 +982,19 @@ def main() -> int:
             f"    {'would create' if dry_run else 'created'}:      "
             f"{len(creates_planned) if dry_run else len(creates_done)}"
         )
+        if creates_skipped_by_stage:
+            skipped_n = sum(creates_skipped_by_stage.values())
+            print(f"    skipped by stage:  {skipped_n}  (--create-stages filter)")
     print(f"  ambiguous matches:   {len(ambiguous)}")
-    print(f"  conflicts:           {len(all_conflicts)}  (existing value differs — NOT overwritten)")
+    if not args.update:
+        print(f"  conflicts:           {len(all_conflicts)}  (existing value differs — NOT overwritten)")
+    print(
+        f"  parent links:        {parent_links_planned} "
+        f"{'planned' if dry_run else 'written'}, "
+        f"{len(parent_changes)} changed, {len(parent_conflicts)} conflicts, "
+        f"{len(parent_unresolved)} unresolved"
+    )
+    print(f"  title mismatches:    {len(title_mismatches)}  (reported only, never written)")
     print(
         f"  unmatched Notion:    {len(unmatched_agencies)}  "
         f"(Agencies not present in xlsx)"
@@ -776,26 +1009,97 @@ def main() -> int:
         print(f"  {n:5}  {b}")
 
     if prop_fill_counts:
-        print(f"\nProperty fills on existing pages ({'planned' if dry_run else 'applied'}):")
+        print(f"\nBlank-property fills on existing pages ({'planned' if dry_run else 'applied'}):")
         for prop, n in prop_fill_counts.most_common():
             print(f"  {n:5}  {prop}")
 
-    if skipped_select_total:
-        print("\nSelect values dropped (option not present on Agencies; add it in Notion if you want them):")
-        for (prop, val), n in skipped_select_total.most_common():
+    if prop_change_counts:
+        print(f"\nValue overwrites by property ({'planned' if dry_run else 'applied'} — --update):")
+        for prop, n in prop_change_counts.most_common():
+            print(f"  {n:5}  {prop}")
+
+    if all_changes:
+        # Classification downgrades off Customer are the highest-stakes
+        # overwrites — always show every one.
+        downgrades = [
+            c for c in all_changes if c[1] == "Classification" and c[3] == "Customer"
+        ]
+        if downgrades:
+            print(f"\n!! Customer downgrades ({len(downgrades)} — verify these are real):")
+            for name, prop, xv, nv in downgrades:
+                print(f"  - {name!r}  Classification: {nv!r} → {xv!r}")
+
+        print(f"\nValue overwrites ({'planned' if dry_run else 'applied'}; notion → xlsx):")
+        for name, prop, xv, nv in all_changes[:80]:
+            print(f"  - {name!r}  {prop}: {nv!r} → {xv!r}")
+        if len(all_changes) > 80:
+            print(f"  ... and {len(all_changes) - 80} more")
+
+        diff_path = Path("agency_upsert_changes.tsv")
+        with diff_path.open("w") as f:
+            f.write("agency\tproperty\tnotion_value\txlsx_value\n")
+            for name, prop, xv, nv in all_changes:
+                f.write(f"{name}\t{prop}\t{nv}\t{xv}\n")
+        print(f"\nFull overwrite list ({len(all_changes)} rows): {diff_path.resolve()}")
+
+    if new_select_total:
+        print("\nNew select options ({} — review colors/dupes in Notion):".format(
+            "will be created" if dry_run else "created"
+        ))
+        for (prop, val), n in new_select_total.most_common():
             print(f"  {n:5}  {prop} = {val!r}")
 
-    if skipped_multi_total:
-        print("\nMulti-select values dropped (option not present):")
-        for (prop, val), n in skipped_multi_total.most_common():
+    if new_multi_total:
+        print("\nNew multi-select options ({}):".format(
+            "will be created" if dry_run else "created"
+        ))
+        for (prop, val), n in new_multi_total.most_common():
             print(f"  {n:5}  {prop} contains {val!r}")
 
     if all_conflicts:
-        print("\nConflicts (existing Notion value differs from xlsx — NOT overwritten):")
+        print("\nConflicts (existing Notion value differs from xlsx — NOT overwritten; use --update):")
         for name, prop, xv, nv in all_conflicts[:50]:
             print(f"  - {name!r}  {prop}: xlsx={xv!r}  notion={nv!r}")
         if len(all_conflicts) > 50:
             print(f"  ... and {len(all_conflicts) - 50} more")
+
+    if title_mismatches:
+        print("\nTitle mismatches (never written — rename by hand if warranted):")
+        for notion_title, sf_name in title_mismatches:
+            print(f"  - notion={notion_title!r}  sf={sf_name!r}")
+
+    if creates_planned and dry_run:
+        print("\nWould-create pages by Account Stage:")
+        by_stage: dict[str, list[str]] = {}
+        for name, stage in creates_planned:
+            by_stage.setdefault(stage, []).append(name)
+        for stage in sorted(by_stage, key=lambda s: -len(by_stage[s])):
+            names = sorted(by_stage[stage])
+            print(f"  {stage} ({len(names)}):")
+            for n in names:
+                print(f"    - {n}")
+
+    if creates_skipped_by_stage:
+        print("\nUnmatched rows skipped by --create-stages:")
+        for stage, n in creates_skipped_by_stage.most_common():
+            print(f"  {n:5}  {stage}")
+
+    if parent_changes:
+        print("\nParent Agency overwrites (--update; old → new):")
+        for child, old, new in parent_changes:
+            print(f"  - {child!r}: {old!r} → {new!r}")
+
+    if parent_conflicts:
+        print("\nParent Agency conflicts (existing differs — NOT overwritten; use --update):")
+        for child, old, new in parent_conflicts:
+            print(f"  - {child!r}: notion={old!r}  xlsx={new!r}")
+
+    if parent_unresolved:
+        print(f"\nParent Account IDs with no matching Agency ({len(parent_unresolved)}):")
+        for child, parent_sf in parent_unresolved[:30]:
+            print(f"  - {child!r} → parent SF {parent_sf}")
+        if len(parent_unresolved) > 30:
+            print(f"  ... and {len(parent_unresolved) - 30} more")
 
     if ambiguous:
         print("\nAmbiguous matches (xlsx name matches multiple Agencies — resolve by hand):")
