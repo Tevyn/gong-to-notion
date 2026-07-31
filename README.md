@@ -53,6 +53,35 @@ uv run python -m gong_to_notion --since 7d --dry-run --dump run.json
 
 After creating each page, `run` also performs the deterministic Agency + Agency Staff fill (resolving Agencies by Salesforce Account ID, then by participant email domain, and creating Staff rows as needed). Pass `--skip-fill` to disable it.
 
+### Agency Staff identity
+
+Staff rows are matched by email address. A person often appears in Gong under
+more than one address (agency domain migrations like `scmtd.com` → `scmetro.org`,
+personal vs work, typo domains Gong picked up from a calendar invite), which used
+to create a second Staff row per address.
+
+The `Other Emails` property on Agency Staff holds every *additional* address a
+person is known by, as free text. `load_fill_caches` indexes it alongside `Email`,
+so a call from any known address resolves to the existing row. Create the property
+once with:
+
+```sh
+uv run python scripts/add_staff_other_emails_property.py
+```
+
+When a call resolves through `Other Emails` and that call is the most recent one
+linked to the person (compared against the `Last Contacted` formula), the address
+it used becomes the primary `Email` and the previous primary moves into
+`Other Emails`. The row keeps matching both either way, so this only keeps the
+displayed address current. Runs report the count as `Primary emails set`.
+
+Notion's `Last edited` is deliberately not used for this: on the current data 80
+of 120 duplicate-cluster rows were last edited by this importer rather than by a
+human, so it tracks our own writes rather than which address is current.
+
+Populating `Other Emails` for people who already have two rows is the job of the
+duplicate merge pass (see [STAFF_MERGE_GUIDELINES.md](STAFF_MERGE_GUIDELINES.md)).
+
 ### Run report and gaps
 
 At the end of a run the report lists Created / Already existed / Failed, plus a **"Gaps in created pages"** section flagging rows a human should follow up on: no Agency linked, no Agency Staff linked, or no Purpose set. Each gap line explains what couldn't be resolved (e.g. an SF Account ID not present in Notion, or attendee domains with no matching Agency). The Purpose gaps are filled by the `customer-interactions-judgment-fill` skill (an LLM pass), not by this CLI.

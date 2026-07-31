@@ -45,6 +45,9 @@ class RunReport:
     external_customer: int = 0
     private_excluded: int = 0
     dry_run: bool = False
+    # Staff rows matched through `Other Emails` where this run's call was the
+    # most recent one, so the address it used became the row's primary Email.
+    staff_emails_promoted: int = 0
     created: list[CreatedRow] = field(default_factory=list)
     skipped: list[SkippedRow] = field(default_factory=list)
     failed: list[FailedRow] = field(default_factory=list)
@@ -64,6 +67,11 @@ class RunReport:
             f"  Failed:                 {len(self.failed)}",
             f"  Dry run: {'yes — no writes performed' if self.dry_run else 'no'}",
         ]
+        if self.staff_emails_promoted:
+            lines.append(
+                f"  Staff primary email updated to a newer address: "
+                f"{self.staff_emails_promoted}"
+            )
         if self.created:
             lines.append("")
             lines.append("Created:")

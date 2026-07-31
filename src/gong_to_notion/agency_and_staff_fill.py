@@ -2,12 +2,19 @@
 
 Flow:
   - Load Agencies → {email_domain: agency_page_id} once per run.
-  - Load Agency Staff → {lowercased_email: staff_page_id} once per run.
+  - Load Agency Staff → {lowercased_email: staff_page_id} once per run, keyed by
+    both the `Email` property and every address in `Other Emails`.
   - For each call's external participants:
       match domain → Agency (may miss);
       find or create Staff row by email (with Agency relation if matched);
       link the Staff row to the call; link the Agency too if matched.
   - Only fills blank fields — never clobbers existing values.
+
+One exception to that last rule: when a call resolves to a Staff row through
+`Other Emails` and that call is the most recent one we've linked to the person,
+the address it used becomes the primary `Email` and the old primary moves into
+`Other Emails`. The row keeps matching every address either way; this only keeps
+the displayed address current. See `find_or_create_staff`.
 
 Purpose is not in scope here — the LLM skill still owns it.
 """
@@ -16,7 +23,8 @@ from __future__ import annotations
 
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 from .notion_client import NotionClient, NotionError
 
@@ -24,6 +32,15 @@ AGENCIES_DATA_SOURCE_ID = "b9945686-eb26-42bb-9020-1e8075466f42"
 AGENCY_STAFF_DATA_SOURCE_ID = "664ccf5e-8cdf-43a4-863c-cfe8ccdef26b"
 
 INTERNAL_DOMAIN = "goswift.ly"
+
+# Additional addresses a Staff row is known by (free text, comma-separated).
+# Created by scripts/add_staff_other_emails_property.py.
+OTHER_EMAILS_PROP = "Other Emails"
+
+# Formula property on Agency Staff: the date of the most recent call linked to
+# the row. Used to decide whether an incoming call is new enough for its address
+# to become the primary one.
+LAST_CONTACTED_PROP = "Last Contacted"
 
 # Excluded when deriving Agency domains from existing Staff emails. Not used
 # to filter Staff creation: a @gmail.com contact is still a valid Staff row,
@@ -67,10 +84,14 @@ class StaffPropertyTypes:
 @dataclass
 class StaffCacheEntry:
     """Everything we need about an existing Agency Staff row to decide whether
-    to top up its Role on backfill."""
+    to top up its Role, and whether an incoming call's address should become the
+    row's primary one."""
 
     staff_id: str
     role: str  # empty string when blank
+    primary_email: str = ""              # value of the `Email` property
+    other_emails: list[str] = field(default_factory=list)  # lowercased, no primary
+    last_contacted: str = ""             # ISO date of the newest linked call, or ""
 
 
 @dataclass
@@ -181,6 +202,54 @@ def _read_rich_text_property(prop: dict | None) -> str:
     return "".join((p.get("plain_text") or "") for p in parts).strip()
 
 
+def _read_other_emails(prop: dict | None) -> list[str]:
+    """Parse `Other Emails` into a lowercased, deduped address list.
+
+    Free text maintained by humans and by the merge pass, so accept comma,
+    semicolon, whitespace and newline separators, tolerate `<>` wrapping, and
+    drop anything without an `@`."""
+    raw = _read_rich_text_property(prop)
+    if not raw:
+        return []
+    out: list[str] = []
+    for token in re.split(r"[,;\s]+", raw):
+        addr = token.strip().strip("<>").strip().lower()
+        if not addr or "@" not in addr:
+            continue
+        if addr not in out:
+            out.append(addr)
+    return out
+
+
+def _read_formula_date(prop: dict | None) -> str:
+    """Read the ISO string out of a date-valued formula property, else ''."""
+    if not prop:
+        return ""
+    formula = prop.get("formula") or {}
+    if formula.get("type") != "date":
+        return ""
+    date = formula.get("date") or {}
+    return (date.get("start") or "").strip()
+
+
+def _parse_dt(raw: str | None) -> datetime | None:
+    """Parse an ISO 8601 timestamp to an aware UTC datetime, else None.
+
+    Gong sends `...Z`; Notion formulas send a local offset; a bare date means
+    midnight. Everything is normalized to UTC so the two are comparable.
+    """
+    s = (raw or "").strip()
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 def _read_url_property(prop: dict | None) -> str:
     if not prop:
         return ""
@@ -227,6 +296,10 @@ def _email_payload(email: str, prop_type: str) -> dict:
 
 def _role_payload(role: str) -> dict:
     return {"rich_text": [{"type": "text", "text": {"content": role}}]}
+
+
+def _other_emails_payload(addresses: list[str]) -> dict:
+    return {"rich_text": [{"type": "text", "text": {"content": ", ".join(addresses)}}]}
 
 
 # ---------------------------------------------------------------------------
@@ -292,22 +365,42 @@ def load_fill_caches(notion: NotionClient) -> FillCaches:
             staff_prop_types.email = email_prop["type"]
             break
 
+    # Two passes so a `Email` value always beats another row's `Other Emails`
+    # claim on the same address.
     email_to_staff: dict[str, StaffCacheEntry] = {}
+    entries: list[tuple[StaffCacheEntry, list[str]]] = []
     for row in staff_rows:
         row_id = row.get("id")
         if not row_id:
             continue
         props = row.get("properties") or {}
-        email = _read_email_property(props.get("Email"))
-        if not email:
+        email = (_read_email_property(props.get("Email")) or "").strip().lower()
+        others = [a for a in _read_other_emails(props.get(OTHER_EMAILS_PROP)) if a != email]
+        if not email and not others:
             continue
-        key = email.strip().lower()
-        if not key:
-            continue
-        role = _read_rich_text_property(props.get("Role"))
-        email_to_staff.setdefault(
-            key, StaffCacheEntry(staff_id=row_id, role=role)
+        entry = StaffCacheEntry(
+            staff_id=row_id,
+            role=_read_rich_text_property(props.get("Role")),
+            primary_email=email,
+            other_emails=others,
+            last_contacted=_read_formula_date(props.get(LAST_CONTACTED_PROP)),
         )
+        if email:
+            email_to_staff.setdefault(email, entry)
+        entries.append((entry, others))
+
+    for entry, others in entries:
+        for addr in others:
+            prior = email_to_staff.get(addr)
+            if prior is None:
+                email_to_staff[addr] = entry
+            elif prior.staff_id != entry.staff_id:
+                print(
+                    f"[agency-fill] WARN: address {addr!r} is claimed by two Staff "
+                    f"rows ({prior.staff_id} and {entry.staff_id}). Keeping the "
+                    f"first; these rows are probably duplicates.",
+                    file=sys.stderr,
+                )
 
     return FillCaches(
         domain_to_agency=domain_to_agency,
@@ -328,6 +421,50 @@ class StaffResolution:
     created: bool
     agency_id: str | None  # agency set on the staff row, if any
     role_updated: bool = False  # filled a previously-blank Role on an existing row
+    email_promoted: bool = False  # made this call's address the row's primary Email
+
+
+def _promote_primary_email(
+    notion: NotionClient,
+    entry: StaffCacheEntry,
+    email: str,
+    call_date: str | None,
+    email_prop_type: str,
+    dry_run: bool,
+) -> bool:
+    """Make `email` the row's primary address if this call is the newest one.
+
+    Only reached when a call resolved to the row through `Other Emails`, so the
+    row already matches both addresses and nothing depends on getting this right.
+    It keeps the displayed address current for people who moved domains, without
+    trusting Notion's `last edited` (which mostly records our own writes).
+
+    Returns True when the primary was swapped.
+    """
+    incoming = _parse_dt(call_date)
+    if incoming is None:
+        return False
+    newest_linked = _parse_dt(entry.last_contacted)
+    if newest_linked is not None and incoming < newest_linked:
+        return False
+
+    old_primary = entry.primary_email
+    remaining = [a for a in entry.other_emails if a != email]
+    if old_primary and old_primary not in remaining:
+        remaining.append(old_primary)
+
+    if not dry_run:
+        notion.update_page(
+            entry.staff_id,
+            {
+                "Email": _email_payload(email, email_prop_type),
+                OTHER_EMAILS_PROP: _other_emails_payload(remaining),
+            },
+        )
+    entry.primary_email = email
+    entry.other_emails = remaining
+    entry.last_contacted = call_date or entry.last_contacted
+    return True
 
 
 def find_or_create_staff(
@@ -337,14 +474,21 @@ def find_or_create_staff(
     agency_id: str | None,
     caches: FillCaches,
     role: str | None = None,
+    call_date: str | None = None,
     dry_run: bool = False,
 ) -> StaffResolution | None:
     """Return the Agency Staff page id for `email`, creating if absent.
+
+    `email` matches against the row's `Email` *or* any address in its
+    `Other Emails`, so a person who shows up under a second address resolves to
+    their existing row instead of getting a new one.
 
     In dry-run, existing matches still resolve (read-only); a missing row
     returns a resolution with a placeholder id that callers treat as
     'would-create'. When `role` is non-empty, fill it on newly created rows
     and on existing rows whose Role is blank (never clobber an existing role).
+    `call_date` is the Gong call's start time, used only to keep the primary
+    address current (see `_promote_primary_email`).
     """
     email = (email or "").strip().lower()
     if not email:
@@ -360,11 +504,22 @@ def find_or_create_staff(
                 notion.update_page(hit.staff_id, {"Role": _role_payload(role_clean)})
             hit.role = role_clean
             role_updated = True
+        email_promoted = False
+        if email != hit.primary_email:
+            email_promoted = _promote_primary_email(
+                notion,
+                hit,
+                email,
+                call_date,
+                caches.staff_prop_types.email,
+                dry_run,
+            )
         return StaffResolution(
             staff_id=hit.staff_id,
             created=False,
             agency_id=None,
             role_updated=role_updated,
+            email_promoted=email_promoted,
         )
 
     properties: dict = {
@@ -379,7 +534,10 @@ def find_or_create_staff(
     if dry_run:
         placeholder = f"dry-run:new-staff:{email}"
         caches.email_to_staff[email] = StaffCacheEntry(
-            staff_id=placeholder, role=role_clean
+            staff_id=placeholder,
+            role=role_clean,
+            primary_email=email,
+            last_contacted=call_date or "",
         )
         return StaffResolution(
             staff_id=placeholder, created=True, agency_id=agency_id
@@ -390,7 +548,12 @@ def find_or_create_staff(
         properties=properties,
     )
     new_id = page.get("id", "")
-    caches.email_to_staff[email] = StaffCacheEntry(staff_id=new_id, role=role_clean)
+    caches.email_to_staff[email] = StaffCacheEntry(
+        staff_id=new_id,
+        role=role_clean,
+        primary_email=email,
+        last_contacted=call_date or "",
+    )
     return StaffResolution(staff_id=new_id, created=True, agency_id=agency_id)
 
 
@@ -405,6 +568,7 @@ class CallResolution:
     staff_ids: list[str]
     new_staff: list[tuple[str, str]]  # (email, staff_id) — for reporting
     roles_updated: int = 0            # existing Staff rows whose blank Role we filled
+    emails_promoted: int = 0          # rows whose primary Email we made current
 
 
 def resolve_call_links(
@@ -412,6 +576,7 @@ def resolve_call_links(
     external_people: list[dict],
     caches: FillCaches,
     sf_account_ids: list[str] | None = None,
+    call_date: str | None = None,
     dry_run: bool = False,
 ) -> CallResolution:
     """Given a list of {email, name, title?} dicts for external participants plus
@@ -421,13 +586,15 @@ def resolve_call_links(
     Agencies are resolved first from Gong's SF Account context (primary); then
     per-participant email domain (fallback). Participant `title` (if present)
     feeds the Agency Staff `Role` field — only on creation or when the existing
-    row's Role is blank."""
+    row's Role is blank. `call_date` is the call's Gong start time; it only
+    decides whether a matched participant's address becomes their primary one."""
     agency_ids: list[str] = []
     staff_ids: list[str] = []
     new_staff: list[tuple[str, str]] = []
     seen_agencies: set[str] = set()
     seen_staff: set[str] = set()
     roles_updated = 0
+    emails_promoted = 0
 
     # SF Account → Agency (primary source of truth).
     for raw_sf in sf_account_ids or []:
@@ -466,6 +633,7 @@ def resolve_call_links(
             agency_id=staff_agency,
             caches=caches,
             role=p.get("title"),
+            call_date=call_date,
             dry_run=dry_run,
         )
         if resolution is None:
@@ -478,12 +646,15 @@ def resolve_call_links(
             new_staff.append((email, resolution.staff_id))
         if resolution.role_updated:
             roles_updated += 1
+        if resolution.email_promoted:
+            emails_promoted += 1
 
     return CallResolution(
         agency_ids=agency_ids,
         staff_ids=staff_ids,
         new_staff=new_staff,
         roles_updated=roles_updated,
+        emails_promoted=emails_promoted,
     )
 
 

@@ -314,8 +314,10 @@ def process_call(
                     external,
                     fill_caches,
                     sf_account_ids=sf_ids,
+                    call_date=call.get("started"),
                     dry_run=False,
                 )
+                report.staff_emails_promoted += resolution.emails_promoted
                 apply_to_page(
                     notion,
                     page_id=page["id"],
@@ -612,6 +614,7 @@ def cmd_backfill_agency_and_staff(args: argparse.Namespace) -> int:
             "staff_added": 0,
             "new_staff": 0,
             "roles_added": 0,
+            "emails_promoted": 0,
             "pages_no_gong_id": len(pages_without_gong_id),
             "pages_no_gong_call": 0,
             "pages_errored": 0,
@@ -645,6 +648,7 @@ def cmd_backfill_agency_and_staff(args: argparse.Namespace) -> int:
                     external,
                     caches,
                     sf_account_ids=call.get("salesforce_account_ids", []),
+                    call_date=call.get("started"),
                     dry_run=args.dry_run,
                 )
                 result = apply_to_page(
@@ -660,6 +664,9 @@ def cmd_backfill_agency_and_staff(args: argparse.Namespace) -> int:
                     overwrite_purpose=True,
                     dry_run=args.dry_run,
                 )
+                # Promotions land on the Staff row, not this call page, so they
+                # are counted separately from `pages_updated`.
+                totals["emails_promoted"] += resolution.emails_promoted
                 changed = (
                     result["agencies_changed"]
                     or result["staff_added"]
@@ -705,6 +712,7 @@ def cmd_backfill_agency_and_staff(args: argparse.Namespace) -> int:
     print(f"  Staff links +:      {totals['staff_added']}")
     print(f"  New Staff rows:     {totals['new_staff']}")
     print(f"  Roles filled:       {totals['roles_added']}")
+    print(f"  Primary emails set: {totals['emails_promoted']}")
     if pages_without_gong_id:
         print("")
         print(f"Pages without a Gong call ID in Link to source ({len(pages_without_gong_id)}):")
