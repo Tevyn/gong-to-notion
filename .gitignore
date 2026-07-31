@@ -8,3 +8,4 @@ __pycache__/
 PRD.md
 agency_upsert_changes.tsv
 email_titled_staff_changes.tsv
+staff_merge_log.tsv

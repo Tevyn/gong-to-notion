@@ -79,8 +79,28 @@ Notion's `Last edited` is deliberately not used for this: on the current data 80
 of 120 duplicate-cluster rows were last edited by this importer rather than by a
 human, so it tracks our own writes rather than which address is current.
 
-Populating `Other Emails` for people who already have two rows is the job of the
-duplicate merge pass (see [STAFF_MERGE_GUIDELINES.md](STAFF_MERGE_GUIDELINES.md)).
+`Other Emails` was populated for people who already had two rows by a one-time
+merge pass over the whole table, in three stages:
+
+```sh
+uv run python scripts/staff_merge_gather.py --out-dir <dir>   # collect facts, read-only
+uv run python scripts/staff_merge_apply.py --dir <dir> [--dry-run]  # validate, then write
+uv run python scripts/staff_merge_verify.py --dir <dir>        # check the result, read-only
+```
+
+It merged 59 duplicate clusters (2,192 rows down to 2,133) and left 2 flagged for
+a human. The rules and the reasoning behind them are in those scripts' module
+docstrings; the longer reviewer-facing write-up is in git history as
+`STAFF_MERGE_GUIDELINES.md`, removed once the pass was finished.
+
+Two constraints in there are worth knowing before touching this data again:
+`GET /v1/pages/{id}` truncates relation values at 25 entries and sets
+`has_more`, so unioning relations from page objects silently drops links; and
+`Agency` / `Customer Conversations` are `dual_property` relations, so writing the
+surviving row updates every Customer Interaction and Agency page by itself.
+
+Rows identified only by a first name ("Andy", "Nick") are deliberately never
+clustered, so a few visible near-duplicates remain where that is all we have.
 
 ### Run report and gaps
 
