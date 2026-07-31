@@ -21,7 +21,6 @@ from dotenv import load_dotenv
 
 from .agency_and_staff_fill import (
     AGENCIES_DATA_SOURCE_ID,
-    AGENCY_STAFF_DATA_SOURCE_ID,
     FREE_MAIL_DOMAINS,
     INTERNAL_DOMAIN,
     apply_to_page,
@@ -715,106 +714,6 @@ def cmd_backfill_agency_and_staff(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
-# seed-agency-domains
-# ---------------------------------------------------------------------------
-
-
-def cmd_seed_agency_domains(args: argparse.Namespace) -> int:
-    """Derive Email Domains for each Agency from its existing Staff emails."""
-    notion_token = _require_env("NOTION_TOKEN")
-
-    with NotionClient(notion_token) as notion:
-        print("[seed] loading Agencies and Agency Staff...", file=sys.stderr)
-        agencies = notion.query_data_source(AGENCIES_DATA_SOURCE_ID)
-        staff = notion.query_data_source(AGENCY_STAFF_DATA_SOURCE_ID)
-
-        agency_names: dict[str, str] = {}
-        existing_domains: dict[str, set[str]] = {}
-        for a in agencies:
-            aid = a.get("id", "")
-            props = a.get("properties") or {}
-            agency_names[aid] = _read_title(props.get("Name"))
-            existing_domains[aid] = set(
-                d.lower()
-                for d in _multi_select_values(props.get("Email Domains"))
-                if d
-            )
-
-        derived: dict[str, set[str]] = {aid: set() for aid in agency_names}
-        staff_without_agency = 0
-        staff_without_email = 0
-        for row in staff:
-            props = row.get("properties") or {}
-            rel = _relation_ids(props.get("Agency"))
-            email_prop = props.get("Email") or {}
-            email = None
-            if email_prop.get("type") == "email":
-                email = (email_prop.get("email") or "").strip() or None
-            elif email_prop.get("type") == "rich_text":
-                parts = email_prop.get("rich_text") or []
-                email = (
-                    "".join((p.get("plain_text") or "") for p in parts).strip() or None
-                )
-            if not email:
-                staff_without_email += 1
-                continue
-            if not rel:
-                staff_without_agency += 1
-                continue
-            domain = extract_domain(email)
-            if not domain:
-                continue
-            if domain in FREE_MAIL_DOMAINS or domain == INTERNAL_DOMAIN:
-                continue
-            for aid in rel:
-                derived.setdefault(aid, set()).add(domain)
-
-        print(
-            f"  {len(agencies)} agencies, {len(staff)} staff "
-            f"({staff_without_email} no email, {staff_without_agency} no agency)",
-            file=sys.stderr,
-        )
-
-        planned: list[tuple[str, str, list[str]]] = []  # (id, name, new_domains_to_add)
-        for aid, domains in derived.items():
-            if not domains:
-                continue
-            to_add = sorted(domains - existing_domains.get(aid, set()))
-            if not to_add:
-                continue
-            planned.append((aid, agency_names.get(aid, "(unknown)"), to_add))
-
-        print("")
-        print(f"Seed Email Domains — {'DRY RUN' if args.dry_run else 'APPLY'}")
-        print(f"  Agencies to update: {len(planned)}")
-        for aid, name, to_add in planned:
-            print(f"  - {name} [{aid}] += {to_add}")
-
-        if args.dry_run or not planned:
-            return 0
-
-        print("")
-        print("Writing...", file=sys.stderr)
-        errors = 0
-        for aid, name, to_add in planned:
-            combined = sorted(existing_domains.get(aid, set()) | set(to_add))
-            try:
-                notion.update_page(
-                    aid,
-                    {
-                        "Email Domains": {
-                            "multi_select": [{"name": d} for d in combined]
-                        }
-                    },
-                )
-            except Exception as e:
-                errors += 1
-                print(f"  ! {name}: {type(e).__name__}: {e}", file=sys.stderr)
-        print(f"Done. {len(planned) - errors} updated, {errors} errored.")
-        return 1 if errors else 0
-
-
-# ---------------------------------------------------------------------------
 # seed-agency-domains-from-website
 # ---------------------------------------------------------------------------
 
@@ -992,7 +891,6 @@ def _multi_select_values(prop: dict | None) -> list[str]:
 _KNOWN_SUBCOMMANDS = {
     "run",
     "backfill-agency-and-staff",
-    "seed-agency-domains",
     "seed-agency-domains-from-website",
 }
 
@@ -1015,14 +913,6 @@ def main() -> int:
     )
     _add_backfill_args(bf_p)
 
-    seed_p = sub.add_parser(
-        "seed-agency-domains",
-        help="Derive Email Domains on each Agency from its existing Staff emails.",
-    )
-    seed_p.add_argument(
-        "--dry-run", action="store_true", help="Print plan without writing."
-    )
-
     seed_web_p = sub.add_parser(
         "seed-agency-domains-from-website",
         help="Derive Email Domains on each Agency from its Website URL.",
@@ -1044,8 +934,6 @@ def main() -> int:
         return cmd_run(args)
     if args.command == "backfill-agency-and-staff":
         return cmd_backfill_agency_and_staff(args)
-    if args.command == "seed-agency-domains":
-        return cmd_seed_agency_domains(args)
     if args.command == "seed-agency-domains-from-website":
         return cmd_seed_agency_domains_from_website(args)
     parser.print_help()

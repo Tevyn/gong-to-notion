@@ -69,14 +69,19 @@ External-customer filtering and private-call exclusion are automatic: only calls
 # Deterministic Agency/Staff/Purpose fill over existing Customer Interactions pages.
 uv run python -m gong_to_notion backfill-agency-and-staff --since 30d [--dry-run]
 
-# Derive each Agency's Email Domains from its existing Staff emails.
-uv run python -m gong_to_notion seed-agency-domains [--dry-run]
-
 # Derive each Agency's Email Domains from its Website URL.
 uv run python -m gong_to_notion seed-agency-domains-from-website [--dry-run]
 ```
 
-All three support `--dry-run` to print a plan without writing.
+Both support `--dry-run` to print a plan without writing.
+
+A third subcommand, `seed-agency-domains`, derived Email Domains from each Agency's
+existing Staff emails. It was removed: Staff rosters routinely include contractor and
+operator addresses (Transdev, RATP Dev, Vontas, Clever Devices, MTM, Connexionz), so it
+wrote shared vendor domains onto individual Agencies. Because a contested domain resolves
+by "keeping first" in `load_fill_caches`, that silently mapped any future call with a
+vendor attendee to an arbitrary Agency. The Website variant is the supported path: it
+derives from the Agency's own URL and holds back collisions and cross-claims for review.
 
 ## scripts/
 
