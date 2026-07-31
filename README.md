@@ -80,18 +80,15 @@ of 120 duplicate-cluster rows were last edited by this importer rather than by a
 human, so it tracks our own writes rather than which address is current.
 
 `Other Emails` was populated for people who already had two rows by a one-time
-merge pass over the whole table, in three stages:
-
-```sh
-uv run python scripts/staff_merge_gather.py --out-dir <dir>   # collect facts, read-only
-uv run python scripts/staff_merge_apply.py --dir <dir> [--dry-run]  # validate, then write
-uv run python scripts/staff_merge_verify.py --dir <dir>        # check the result, read-only
-```
-
+merge pass over the whole table: gather facts, validate decisions, apply, verify.
 It merged 59 duplicate clusters (2,192 rows down to 2,133) and left 2 flagged for
-a human. The rules and the reasoning behind them are in those scripts' module
-docstrings; the longer reviewer-facing write-up is in git history as
-`STAFF_MERGE_GUIDELINES.md`, removed once the pass was finished.
+a human.
+
+That pass was a one-off, so its three scripts and the reviewer-facing
+`STAFF_MERGE_GUIDELINES.md` were removed once it finished. Both live in git
+history at commit `8ad8726` and can be restored with
+`git checkout 8ad8726 -- scripts/staff_merge_gather.py` (and likewise for
+`staff_merge_apply.py`, `staff_merge_verify.py`, `STAFF_MERGE_GUIDELINES.md`).
 
 Two constraints in there are worth knowing before touching this data again:
 `GET /v1/pages/{id}` truncates relation values at 25 entries and sets
